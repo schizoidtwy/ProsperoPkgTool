@@ -45,6 +45,15 @@ public sealed class OuterPfsReader
     private readonly long _pfsOffset;
     private readonly long _pfsSize;
 
+    // Recently decrypted pfs_image.dat blocks served by ReadInnerImageRegion. Inner (NAPS) blocks are
+    // far smaller than a 64 KiB outer block, so sequential region reads land in the same outer block
+    // many times; caching the plaintext decrypts each outer block once. _cacheLock guards the
+    // entries and also serializes the shared stream for these reads.
+    private const int DecryptedBlockCacheSize = 4;
+    private readonly DecryptedBlock[] _decryptedBlocks = new DecryptedBlock[DecryptedBlockCacheSize];
+    private readonly Lock _cacheLock = new();
+    private long _cacheClock;
+
     public int SuperblockIndex { get; }
     public int BlockCount { get; }
     public byte[] Seed { get; }
@@ -126,19 +135,72 @@ public sealed class OuterPfsReader
         if (blockIndex < 0 || blockIndex >= BlockCount)
             throw new ArgumentOutOfRangeException(nameof(blockIndex));
 
-        byte[] raw = new byte[BlockSize];
-        ReadBlockRaw(_stream, _pfsOffset, blockIndex, raw);
+        byte[] block = new byte[BlockSize];
+        ReadBlockInto(xts, blockIndex, signed, block);
+        return block;
+    }
+
+    /// <summary>Read block <paramref name="blockIndex"/> and decrypt it in place in <paramref name="block"/>.</summary>
+    private void ReadBlockInto(AesXts xts, int blockIndex, bool signed, byte[] block)
+    {
+        ReadBlockRaw(_stream, _pfsOffset, blockIndex, block);
 
         if (blockIndex == SuperblockIndex)
-            return raw; // superblock is plaintext
+            return; // superblock is plaintext
 
         // Community / plain builds store the whole outer PFS unencrypted; the superblock seed is
         // the literal PPRPLAIN-NOAUTH! marker, so no XTS key derivation or decryption applies.
         if (IsPlainNoAuth)
-            return raw;
+            return;
 
         ulong sector = signed ? ((ulong)(uint)blockIndex | SignedSectorFlag) : (ulong)(uint)blockIndex;
-        return xts.Decrypt(raw, sector);
+        xts.Decrypt(block, block, sector);
+    }
+
+    /// <summary>
+    /// Return the decrypted block from the small per-reader cache, reading and decrypting it on a miss
+    /// (evicting the least recently used entry). The returned buffer is owned by the cache: callers
+    /// must hold <see cref="_cacheLock"/> while they copy from it and must not modify it.
+    /// </summary>
+    private byte[] GetCachedBlock(AesXts xts, int blockIndex, bool signed)
+    {
+        long clock = ++_cacheClock;
+        DecryptedBlock? victim = null;
+        for (int i = 0; i < _decryptedBlocks.Length; i++)
+        {
+            DecryptedBlock? entry = _decryptedBlocks[i];
+            if (entry is null)
+            {
+                victim = _decryptedBlocks[i] = new DecryptedBlock();
+                break;
+            }
+            if (entry.Valid && entry.Index == blockIndex && entry.Signed == signed && ReferenceEquals(entry.Xts, xts))
+            {
+                entry.LastUse = clock;
+                return entry.Plaintext;
+            }
+            if (victim is null || entry.LastUse < victim.LastUse)
+                victim = entry;
+        }
+
+        victim!.Valid = false; // stays invalid if the read or decrypt throws
+        ReadBlockInto(xts, blockIndex, signed, victim.Plaintext);
+        victim.Xts = xts;
+        victim.Index = blockIndex;
+        victim.Signed = signed;
+        victim.LastUse = clock;
+        victim.Valid = true;
+        return victim.Plaintext;
+    }
+
+    private sealed class DecryptedBlock
+    {
+        public readonly byte[] Plaintext = new byte[BlockSize];
+        public AesXts? Xts;
+        public int Index;
+        public bool Signed;
+        public bool Valid;
+        public long LastUse;
     }
 
     /// <summary>
@@ -172,7 +234,9 @@ public sealed class OuterPfsReader
 
     /// <summary>
     /// Decrypt and return an arbitrary byte range of <c>pfs_image.dat</c> in 64 KiB block-sized
-    /// reads, so multi-GB images can be consumed without materializing the whole span.
+    /// reads, so multi-GB images can be consumed without materializing the whole span. Recently
+    /// decrypted blocks are cached per reader, so consecutive small regions (one per inner NAPS
+    /// block) that share an outer block decrypt it only once.
     /// </summary>
     public byte[] ReadInnerImageRegion(AesXts xts, long offset, int length)
     {
@@ -186,13 +250,16 @@ public sealed class OuterPfsReader
         int lastBlock = checked((int)((offset + length - 1) / BlockSize));
         var result = new byte[length];
         int destination = 0;
-        for (int blockIndex = firstBlock; blockIndex <= lastBlock; blockIndex++)
+        lock (_cacheLock)
         {
-            byte[] plaintext = ReadBlock(xts, blockIndex, signed: false);
-            int startInBlock = blockIndex == firstBlock ? (int)(offset - (long)blockIndex * BlockSize) : 0;
-            int take = (int)Math.Min(BlockSize - startInBlock, length - destination);
-            Array.Copy(plaintext, startInBlock, result, destination, take);
-            destination += take;
+            for (int blockIndex = firstBlock; blockIndex <= lastBlock; blockIndex++)
+            {
+                byte[] plaintext = GetCachedBlock(xts, blockIndex, signed: false);
+                int startInBlock = blockIndex == firstBlock ? (int)(offset - (long)blockIndex * BlockSize) : 0;
+                int take = (int)Math.Min(BlockSize - startInBlock, length - destination);
+                Array.Copy(plaintext, startInBlock, result, destination, take);
+                destination += take;
+            }
         }
         return result;
     }
